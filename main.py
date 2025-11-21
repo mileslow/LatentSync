@@ -114,7 +114,7 @@ def get_video_duration(video_path: str) -> float:
 
 def preprocess_video(input_path: str, output_path: str, start_time: float = None) -> bool:
     """
-    Preprocess video: trim to 20 seconds at specified time, convert to 25fps
+    Preprocess video: trim to 5 seconds at specified time, convert to 25fps
     
     Args:
         input_path: Path to the input video
@@ -132,13 +132,13 @@ def preprocess_video(input_path: str, output_path: str, start_time: float = None
             return False
         
         # Determine clip duration and start time
-        clip_duration = min(20, duration)
+        clip_duration = min(5, duration)
         
         if start_time is None:
-            # Default: 20-second interval before the last 10 seconds
+            # Default: 5-second interval before the last 10 seconds
             end_time = duration - 10
-            start_time = max(0, end_time - 20)
-            print(f"[INFO] Using default strategy: 20s before last 10s")
+            start_time = max(0, end_time - 5)
+            print(f"[INFO] Using default strategy: 5s before last 10s")
         else:
             # Use provided start time
             start_time = max(0, min(start_time, duration - clip_duration))
@@ -358,32 +358,32 @@ def detect_sync():
                     "error": "Could not determine video duration"
                 }), 400
             
-            # Define multiple sampling strategies (20-second clips at different positions)
+            # Define multiple sampling strategies (5-second clips at different positions)
             sampling_strategies = []
             
-            # Strategy 1: 20s before last 10s (default)
-            if duration >= 30:
+            # Strategy 1: 5s before last 10s (default)
+            if duration >= 15:
                 sampling_strategies.append({
-                    "name": "end section (20s before last 10s)",
-                    "start_time": duration - 30
+                    "name": "end section (5s before last 10s)",
+                    "start_time": duration - 15
                 })
             
-            # Strategy 2: Middle 20s
-            if duration >= 20:
-                middle_start = max(0, (duration - 20) / 2)
+            # Strategy 2: Middle 5s
+            if duration >= 5:
+                middle_start = max(0, (duration - 5) / 2)
                 sampling_strategies.append({
                     "name": "middle section",
                     "start_time": middle_start
                 })
             
-            # Strategy 3: First 20s
+            # Strategy 3: First 5s
             sampling_strategies.append({
                 "name": "beginning section",
                 "start_time": 0
             })
             
             # Strategy 4: 25% through the video
-            if duration >= 40:
+            if duration >= 20:
                 quarter_start = duration * 0.25
                 sampling_strategies.append({
                     "name": "quarter section (25% through)",
@@ -573,6 +573,7 @@ def home():
             "Confidence >= 3.0 indicates the video is in sync",
             "AV offset is measured in frames (25 FPS)",
             "Requires faces to be visible in the video",
+            "Samples 5-second clips from multiple locations in the video",
             "Processing time depends on video length"
         ]
     })
