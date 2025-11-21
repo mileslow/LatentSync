@@ -2,13 +2,8 @@ import time
 import numpy as np
 import cv2
 import torch
-from torchvision import transforms
-from .nets import S3FDNet
+from ultralytics import YOLO
 from .box_utils import nms_
-from latentsync.utils.util import check_model_and_download
-
-PATH_WEIGHT = "checkpoints/auxiliary/sfd_face.pth"
-img_mean = np.array([104.0, 117.0, 123.0])[:, np.newaxis, np.newaxis].astype("float32")
 
 
 class S3FD:
@@ -18,12 +13,8 @@ class S3FD:
         tstamp = time.time()
         self.device = device
 
-        print("[S3FD] loading with", self.device)
-        self.net = S3FDNet(device=self.device).to(self.device)
-        check_model_and_download(PATH_WEIGHT)
-        state_dict = torch.load(PATH_WEIGHT, map_location=self.device, weights_only=True)
-        self.net.load_state_dict(state_dict)
-        self.net.eval()
+        print("[S3FD] loading YOLOv8n on", self.device)
+        self.net = YOLO("yolov8n.pt")
         print("[S3FD] finished loading (%.4f sec)" % (time.time() - tstamp))
 
     def detect_faces(self, image, conf_th=0.8, scales=[1]):
@@ -34,30 +25,31 @@ class S3FD:
 
         with torch.no_grad():
             for s in scales:
-                scaled_img = cv2.resize(image, dsize=(0, 0), fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
-
-                scaled_img = np.swapaxes(scaled_img, 1, 2)
-                scaled_img = np.swapaxes(scaled_img, 1, 0)
-                scaled_img = scaled_img[[2, 1, 0], :, :]
-                scaled_img = scaled_img.astype("float32")
-                scaled_img -= img_mean
-                scaled_img = scaled_img[[2, 1, 0], :, :]
-                x = torch.from_numpy(scaled_img).unsqueeze(0).to(self.device)
-                y = self.net(x)
-
-                detections = y.data
-                scale = torch.Tensor([w, h, w, h])
-
-                for i in range(detections.size(1)):
-                    j = 0
-                    while detections[0, i, j, 0] > conf_th:
-                        score = detections[0, i, j, 0]
-                        pt = (detections[0, i, j, 1:] * scale).cpu().numpy()
-                        bbox = (pt[0], pt[1], pt[2], pt[3], score)
-                        bboxes = np.vstack((bboxes, bbox))
-                        j += 1
-
-            keep = nms_(bboxes, 0.1)
-            bboxes = bboxes[keep]
+                # Lower conf threshold for better detection
+                effective_conf = max(0.3, conf_th * 0.5)
+                
+                # Run YOLO inference
+                results = self.net(image, conf=effective_conf, verbose=False, imgsz=int(640 * s), device=self.device)
+                
+                if len(results) > 0:
+                    result = results[0]
+                    
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        boxes = result.boxes.xyxy.cpu().numpy()
+                        confs = result.boxes.conf.cpu().numpy()
+                        classes = result.boxes.cls.cpu().numpy()
+                        
+                        # Filter for person class (0) in COCO
+                        mask = classes == 0
+                        boxes = boxes[mask]
+                        confs = confs[mask]
+                        
+                        for box, conf in zip(boxes, confs):
+                            bbox = (box[0], box[1], box[2], box[3], conf)
+                            bboxes = np.vstack((bboxes, bbox))
+            
+            if len(bboxes) > 0:
+                keep = nms_(bboxes, 0.1)
+                bboxes = bboxes[keep]
 
         return bboxes

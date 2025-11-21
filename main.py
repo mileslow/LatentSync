@@ -8,6 +8,8 @@ import tempfile
 import uuid
 from pathlib import Path
 from statistics import fmean
+import subprocess
+import json
 from flask import Flask, request, jsonify
 import requests
 import torch
@@ -74,6 +76,113 @@ def download_video(video_url: str, output_path: str) -> bool:
         return False
 
 
+def get_video_duration(video_path: str) -> float:
+    """
+    Get video duration in seconds using ffprobe
+    
+    Args:
+        video_path: Path to the video file
+        
+    Returns:
+        Duration in seconds, or 0 if failed
+    """
+    try:
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'json',
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        duration = float(data['format']['duration'])
+        print(f"[INFO] Video duration: {duration:.2f} seconds")
+        return duration
+    except Exception as e:
+        print(f"[ERROR] Failed to get video duration: {str(e)}")
+        return 0
+
+
+def preprocess_video(input_path: str, output_path: str) -> bool:
+    """
+    Preprocess video: trim to 20 seconds before the last 10 seconds, convert to 25fps
+    
+    Args:
+        input_path: Path to the input video
+        output_path: Path to save the processed video
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Get video duration
+        duration = get_video_duration(input_path)
+        if duration == 0:
+            print("[ERROR] Could not determine video duration")
+            return False
+        
+        # Calculate 20-second interval before the last 10 seconds
+        # End time: duration - 10 seconds
+        # Start time: end_time - 20 seconds
+        end_time = duration - 10
+        start_time = max(0, end_time - 20)
+        
+        # Adjust if video is shorter than 30 seconds
+        if duration < 30:
+            print(f"[WARN] Video is only {duration:.2f}s, using first 20s or entire video")
+            start_time = 0
+            clip_duration = min(20, duration)
+        else:
+            clip_duration = 20
+            print(f"[INFO] Extracting 20s clip from {start_time:.2f}s to {end_time:.2f}s")
+        
+        # Use ffmpeg to trim and reencode
+        # -threads 0: auto-detect optimal thread count
+        # -ss: start time (placed before -i for faster seeking)
+        # -t: duration
+        # Force reencode with proper settings for sync detection
+        cmd = [
+            'ffmpeg',
+            '-threads', '0',
+            '-y',  # overwrite output
+            '-nostdin',
+            '-loglevel', 'error',
+            '-ss', str(start_time),
+            '-i', input_path,
+            '-t', str(clip_duration),
+            '-c:v', 'libx264',  # Force H.264 video reencoding
+            '-preset', 'medium',  # Encoding speed/quality tradeoff
+            '-crf', '23',  # Constant quality (lower = better quality)
+            '-r', '25',  # Force 25 fps output
+            '-pix_fmt', 'yuv420p',  # Pixel format for compatibility
+            '-c:a', 'aac',  # Force AAC audio reencoding
+            '-ar', '16000',  # Audio sample rate (16kHz for sync detection)
+            '-ac', '1',  # Mono audio
+            '-b:a', '128k',  # Audio bitrate
+            '-async', '1',  # Audio sync method
+            '-vsync', 'cfr',  # Constant frame rate
+            output_path
+        ]
+        
+        print(f"[INFO] Preprocessing video: {start_time:.2f}s - {start_time + clip_duration:.2f}s at 25fps")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[INFO] Video preprocessed successfully: {output_path}")
+            return True
+        else:
+            print("[ERROR] Preprocessed video is empty or not created")
+            return False
+            
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] FFmpeg preprocessing failed: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Video preprocessing failed: {str(e)}")
+        return False
+
+
 def evaluate_sync(video_path: str, temp_dir: str) -> dict:
     """
     Evaluate audio-visual synchronization of a video
@@ -86,14 +195,21 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
         Dictionary with sync results
     """
     try:
+        print(f"[INFO] Starting sync evaluation for: {video_path}")
+        
         # Run SyncNet detection
+        print("[INFO] Running face detection and tracking...")
         syncnet_detector(video_path=video_path, min_track=50)
+        print("[INFO] Face detection completed")
         
         # Check if faces were detected
         crop_dir = os.path.join(DETECT_RESULTS_DIR, "crop")
         crop_videos = os.listdir(crop_dir) if os.path.exists(crop_dir) else []
         
+        print(f"[INFO] Found {len(crop_videos)} face track(s)")
+        
         if not crop_videos:
+            print("[WARN] No faces detected in the video")
             return {
                 "success": False,
                 "error": "No faces detected in the video",
@@ -106,7 +222,8 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
         av_offset_list = []
         conf_list = []
         
-        for video in crop_videos:
+        for i, video in enumerate(crop_videos, 1):
+            print(f"[INFO] Evaluating face track {i}/{len(crop_videos)}: {video}")
             crop_video_path = os.path.join(crop_dir, video)
             av_offset, _, conf = syncnet.evaluate(
                 video_path=crop_video_path,
@@ -114,6 +231,7 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
             )
             av_offset_list.append(av_offset)
             conf_list.append(conf)
+            print(f"[INFO] Face {i} - Offset: {av_offset}, Confidence: {conf:.2f}")
         
         # Calculate average confidence and offset
         avg_confidence = fmean(conf_list)
@@ -121,6 +239,9 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
         
         # Binary classification: synced or desynced
         is_synced = avg_confidence >= SYNC_CONFIDENCE_THRESHOLD
+        
+        print(f"[INFO] Average confidence: {avg_confidence:.2f}, Average offset: {avg_offset}")
+        print(f"[INFO] Result: {'SYNCED' if is_synced else 'DESYNCED'}")
         
         return {
             "success": True,
@@ -132,6 +253,9 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
         }
         
     except Exception as e:
+        print(f"[ERROR] Sync evaluation failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e),
@@ -182,47 +306,73 @@ def detect_sync():
             }), 400
         
         video_url = data['video_url']
+        print(f"\n[REQUEST] New sync detection request for: {video_url}")
         
         # Create unique temporary directory for this request
         request_id = str(uuid.uuid4())
         temp_dir = os.path.join(TEMP_DIR_BASE, request_id)
         os.makedirs(temp_dir, exist_ok=True)
+        print(f"[INFO] Created temporary directory: {temp_dir}")
         
-        video_path = os.path.join(temp_dir, "input_video.mp4")
+        raw_video_path = os.path.join(temp_dir, "raw_video.mp4")
+        processed_video_path = os.path.join(temp_dir, "processed_video.mp4")
         
         try:
             # Download video
-            if not download_video(video_url, video_path):
+            if not download_video(video_url, raw_video_path):
+                print("[ERROR] Video download failed")
                 return jsonify({
                     "success": False,
                     "error": "Failed to download video from URL"
                 }), 400
             
             # Check if file exists and has content
-            if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+            file_size = os.path.getsize(raw_video_path) if os.path.exists(raw_video_path) else 0
+            print(f"[INFO] Raw video file size: {file_size / (1024*1024):.2f} MB")
+            
+            if not os.path.exists(raw_video_path) or file_size == 0:
+                print("[ERROR] Downloaded video is empty or invalid")
                 return jsonify({
                     "success": False,
                     "error": "Downloaded video file is empty or invalid"
                 }), 400
             
-            # Evaluate sync
-            result = evaluate_sync(video_path, temp_dir)
+            # Preprocess video: trim to 20s and convert to 25fps
+            print("[INFO] Preprocessing video (trimming and converting to 25fps)...")
+            if not preprocess_video(raw_video_path, processed_video_path):
+                print("[ERROR] Video preprocessing failed")
+                return jsonify({
+                    "success": False,
+                    "error": "Failed to preprocess video"
+                }), 400
+            
+            # Evaluate sync on preprocessed video
+            print("[INFO] Starting sync evaluation pipeline...")
+            result = evaluate_sync(processed_video_path, temp_dir)
             
             # Clean up temporary files
+            print("[INFO] Cleaning up temporary files...")
             import shutil
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+                print(f"[INFO] Removed temp directory: {temp_dir}")
             if os.path.exists(DETECT_RESULTS_DIR):
                 shutil.rmtree(DETECT_RESULTS_DIR)
+                print(f"[INFO] Removed detect results directory: {DETECT_RESULTS_DIR}")
             
             if result["success"]:
+                print(f"[SUCCESS] Request completed successfully - Synced: {result['is_synced']}\n")
                 return jsonify(result), 200
             else:
+                print(f"[ERROR] Request failed: {result.get('error', 'Unknown error')}\n")
                 return jsonify(result), 500
                 
         except Exception as e:
             # Clean up on error
+            print(f"[ERROR] Exception during processing: {str(e)}")
             import shutil
+            import traceback
+            traceback.print_exc()
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
             if os.path.exists(DETECT_RESULTS_DIR):
@@ -230,6 +380,9 @@ def detect_sync():
             raise e
             
     except Exception as e:
+        print(f"[ERROR] Unhandled exception in detect_sync: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "success": False,
             "error": f"Server error: {str(e)}"
@@ -287,7 +440,7 @@ if __name__ == '__main__':
     # Run Flask app
     app.run(
         host='0.0.0.0',
-        port=5000,
+        port=8080,
         debug=False,  # Set to False in production
         threaded=True
     )
