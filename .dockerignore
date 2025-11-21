@@ -1,0 +1,44 @@
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist
+build
+.pytest_cache
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git
+.gitignore
+
+# Temporary files
+temp_api/
+detect_results_api/
+*.log
+*.tmp
+
+# macOS
+.DS_Store
+
+# Model outputs (if large)
+outputs/
+results/
+
+# Documentation
+*.md
+!README.md
+

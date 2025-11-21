@@ -106,7 +106,7 @@ def get_video_duration(video_path: str) -> float:
 
 def preprocess_video(input_path: str, output_path: str) -> bool:
     """
-    Preprocess video: trim to 20 seconds before the last 10 seconds, convert to 25fps
+    Preprocess video: trim to 40 seconds before the last 10 seconds, convert to 25fps
     
     Args:
         input_path: Path to the input video
@@ -122,20 +122,20 @@ def preprocess_video(input_path: str, output_path: str) -> bool:
             print("[ERROR] Could not determine video duration")
             return False
         
-        # Calculate 20-second interval before the last 10 seconds
+        # Calculate 40-second interval before the last 10 seconds
         # End time: duration - 10 seconds
-        # Start time: end_time - 20 seconds
+        # Start time: end_time - 40 seconds
         end_time = duration - 10
-        start_time = max(0, end_time - 20)
+        start_time = max(0, end_time - 40)
         
-        # Adjust if video is shorter than 30 seconds
-        if duration < 30:
-            print(f"[WARN] Video is only {duration:.2f}s, using first 20s or entire video")
+        # Adjust if video is shorter than 50 seconds
+        if duration < 50:
+            print(f"[WARN] Video is only {duration:.2f}s, using first 40s or entire video")
             start_time = 0
-            clip_duration = min(20, duration)
+            clip_duration = min(40, duration)
         else:
-            clip_duration = 20
-            print(f"[INFO] Extracting 20s clip from {start_time:.2f}s to {end_time:.2f}s")
+            clip_duration = 40
+            print(f"[INFO] Extracting 40s clip from {start_time:.2f}s to {end_time:.2f}s")
         
         # Use ffmpeg to trim and reencode
         # -threads 0: auto-detect optimal thread count
@@ -219,8 +219,7 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
             }
         
         # Evaluate sync for each detected face
-        av_offset_list = []
-        conf_list = []
+        results = []
         
         for i, video in enumerate(crop_videos, 1):
             print(f"[INFO] Evaluating face track {i}/{len(crop_videos)}: {video}")
@@ -229,27 +228,31 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
                 video_path=crop_video_path,
                 temp_dir=temp_dir
             )
-            av_offset_list.append(av_offset)
-            conf_list.append(conf)
+            results.append({'offset': av_offset, 'confidence': conf})
             print(f"[INFO] Face {i} - Offset: {av_offset}, Confidence: {conf:.2f}")
         
-        # Calculate average confidence and offset
-        avg_confidence = fmean(conf_list)
-        avg_offset = int(fmean(av_offset_list))
+        # Use MAXIMUM confidence (best synced face)
+        # This correctly handles videos where only some people are speaking
+        best_result = max(results, key=lambda x: x['confidence'])
+        max_confidence = best_result['confidence']
+        best_offset = best_result['offset']
         
-        # Binary classification: synced or desynced
-        is_synced = avg_confidence >= SYNC_CONFIDENCE_THRESHOLD
+        # Binary classification: synced or desynced based on best face
+        is_synced = max_confidence >= SYNC_CONFIDENCE_THRESHOLD
         
-        print(f"[INFO] Average confidence: {avg_confidence:.2f}, Average offset: {avg_offset}")
+        all_confidences = [r['confidence'] for r in results]
+        print(f"[INFO] Best confidence: {max_confidence:.2f} (from track with offset: {best_offset})")
+        print(f"[INFO] All confidences: {all_confidences}")
         print(f"[INFO] Result: {'SYNCED' if is_synced else 'DESYNCED'}")
         
         return {
             "success": True,
-            "confidence": round(avg_confidence, 2),
-            "av_offset": avg_offset,
+            "confidence": round(max_confidence, 2),
+            "av_offset": best_offset,
             "is_synced": is_synced,
             "threshold": SYNC_CONFIDENCE_THRESHOLD,
-            "num_faces_detected": len(crop_videos)
+            "num_faces_detected": len(crop_videos),
+            "all_confidences": [round(r['confidence'], 2) for r in results]
         }
         
     except Exception as e:
@@ -437,10 +440,13 @@ if __name__ == '__main__':
     print("Starting Flask server...")
     print("=" * 60)
     
+    # Get port from environment variable (for Cloud Run compatibility)
+    port = int(os.environ.get('PORT', 8080))
+    
     # Run Flask app
     app.run(
         host='0.0.0.0',
-        port=8080,
+        port=port,
         debug=False,  # Set to False in production
         threaded=True
     )
