@@ -87,6 +87,11 @@ def get_video_duration(video_path: str) -> float:
         Duration in seconds, or 0 if failed
     """
     try:
+        # Check if file exists first
+        if not os.path.exists(video_path):
+            print(f"[ERROR] Video file does not exist: {video_path}")
+            return 0
+        
         cmd = [
             'ffprobe',
             '-v', 'error',
@@ -99,18 +104,22 @@ def get_video_duration(video_path: str) -> float:
         duration = float(data['format']['duration'])
         print(f"[INFO] Video duration: {duration:.2f} seconds")
         return duration
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] ffprobe failed: {e.stderr if e.stderr else str(e)}")
+        return 0
     except Exception as e:
         print(f"[ERROR] Failed to get video duration: {str(e)}")
         return 0
 
 
-def preprocess_video(input_path: str, output_path: str) -> bool:
+def preprocess_video(input_path: str, output_path: str, start_time: float = None) -> bool:
     """
-    Preprocess video: trim to 40 seconds before the last 10 seconds, convert to 25fps
+    Preprocess video: trim to 20 seconds at specified time, convert to 25fps
     
     Args:
         input_path: Path to the input video
         output_path: Path to save the processed video
+        start_time: Start time in seconds (if None, uses default strategy)
         
     Returns:
         True if successful, False otherwise
@@ -122,20 +131,19 @@ def preprocess_video(input_path: str, output_path: str) -> bool:
             print("[ERROR] Could not determine video duration")
             return False
         
-        # Calculate 40-second interval before the last 10 seconds
-        # End time: duration - 10 seconds
-        # Start time: end_time - 40 seconds
-        end_time = duration - 10
-        start_time = max(0, end_time - 40)
+        # Determine clip duration and start time
+        clip_duration = min(20, duration)
         
-        # Adjust if video is shorter than 50 seconds
-        if duration < 50:
-            print(f"[WARN] Video is only {duration:.2f}s, using first 40s or entire video")
-            start_time = 0
-            clip_duration = min(40, duration)
+        if start_time is None:
+            # Default: 20-second interval before the last 10 seconds
+            end_time = duration - 10
+            start_time = max(0, end_time - 20)
+            print(f"[INFO] Using default strategy: 20s before last 10s")
         else:
-            clip_duration = 40
-            print(f"[INFO] Extracting 40s clip from {start_time:.2f}s to {end_time:.2f}s")
+            # Use provided start time
+            start_time = max(0, min(start_time, duration - clip_duration))
+        
+        print(f"[INFO] Extracting {clip_duration:.1f}s clip from {start_time:.2f}s to {start_time + clip_duration:.2f}s")
         
         # Use ffmpeg to trim and reencode
         # -threads 0: auto-detect optimal thread count
@@ -224,9 +232,11 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
         for i, video in enumerate(crop_videos, 1):
             print(f"[INFO] Evaluating face track {i}/{len(crop_videos)}: {video}")
             crop_video_path = os.path.join(crop_dir, video)
+            # Use a separate temp directory for syncnet to avoid it deleting our files
+            syncnet_temp_dir = os.path.join(temp_dir, f"syncnet_temp_{i}")
             av_offset, _, conf = syncnet.evaluate(
                 video_path=crop_video_path,
-                temp_dir=temp_dir
+                temp_dir=syncnet_temp_dir
             )
             results.append({'offset': av_offset, 'confidence': conf})
             print(f"[INFO] Face {i} - Offset: {av_offset}, Confidence: {conf:.2f}")
@@ -318,7 +328,6 @@ def detect_sync():
         print(f"[INFO] Created temporary directory: {temp_dir}")
         
         raw_video_path = os.path.join(temp_dir, "raw_video.mp4")
-        processed_video_path = os.path.join(temp_dir, "processed_video.mp4")
         
         try:
             # Download video
@@ -340,28 +349,174 @@ def detect_sync():
                     "error": "Downloaded video file is empty or invalid"
                 }), 400
             
-            # Preprocess video: trim to 20s and convert to 25fps
-            print("[INFO] Preprocessing video (trimming and converting to 25fps)...")
-            if not preprocess_video(raw_video_path, processed_video_path):
-                print("[ERROR] Video preprocessing failed")
+            # Get video duration to plan sampling strategies
+            duration = get_video_duration(raw_video_path)
+            if duration == 0:
+                print("[ERROR] Could not determine video duration")
                 return jsonify({
                     "success": False,
-                    "error": "Failed to preprocess video"
+                    "error": "Could not determine video duration"
                 }), 400
             
-            # Evaluate sync on preprocessed video
-            print("[INFO] Starting sync evaluation pipeline...")
-            result = evaluate_sync(processed_video_path, temp_dir)
+            # Define multiple sampling strategies (20-second clips at different positions)
+            sampling_strategies = []
             
-            # Clean up temporary files
-            print("[INFO] Cleaning up temporary files...")
-            import shutil
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-                print(f"[INFO] Removed temp directory: {temp_dir}")
-            if os.path.exists(DETECT_RESULTS_DIR):
-                shutil.rmtree(DETECT_RESULTS_DIR)
-                print(f"[INFO] Removed detect results directory: {DETECT_RESULTS_DIR}")
+            # Strategy 1: 20s before last 10s (default)
+            if duration >= 30:
+                sampling_strategies.append({
+                    "name": "end section (20s before last 10s)",
+                    "start_time": duration - 30
+                })
+            
+            # Strategy 2: Middle 20s
+            if duration >= 20:
+                middle_start = max(0, (duration - 20) / 2)
+                sampling_strategies.append({
+                    "name": "middle section",
+                    "start_time": middle_start
+                })
+            
+            # Strategy 3: First 20s
+            sampling_strategies.append({
+                "name": "beginning section",
+                "start_time": 0
+            })
+            
+            # Strategy 4: 25% through the video
+            if duration >= 40:
+                quarter_start = duration * 0.25
+                sampling_strategies.append({
+                    "name": "quarter section (25% through)",
+                    "start_time": quarter_start
+                })
+            
+            print(f"[INFO] Video duration: {duration:.1f}s, will try {len(sampling_strategies)} sampling location(s)")
+            
+            # Try each sampling strategy until we get synced faces
+            result = None
+            best_desynced_result = None  # Track best result even if desynced
+            errors_encountered = []  # Track errors during processing
+            successful_attempts = 0
+            
+            for i, strategy in enumerate(sampling_strategies, 1):
+                print(f"\n[ATTEMPT {i}/{len(sampling_strategies)}] Trying {strategy['name']}...")
+                
+                # Verify raw video still exists
+                if not os.path.exists(raw_video_path):
+                    print(f"[ERROR] Raw video file missing: {raw_video_path}")
+                    errors_encountered.append({
+                        "location": strategy["name"],
+                        "error": "Raw video file missing"
+                    })
+                    continue
+                
+                # Create unique processed video path for this attempt
+                processed_video_path = os.path.join(temp_dir, f"processed_video_{i}.mp4")
+                
+                # Preprocess video with this strategy
+                if not preprocess_video(raw_video_path, processed_video_path, start_time=strategy['start_time']):
+                    print(f"[WARN] Preprocessing failed for {strategy['name']}, trying next...")
+                    errors_encountered.append({
+                        "location": strategy["name"],
+                        "error": "Preprocessing failed"
+                    })
+                    continue
+                
+                # Evaluate sync on preprocessed video (wrap in try-except to catch errors)
+                try:
+                    print(f"[INFO] Starting sync evaluation for {strategy['name']}...")
+                    result = evaluate_sync(processed_video_path, temp_dir)
+                    
+                    # Check if we successfully detected faces AND they are synced
+                    if result["success"] and result.get("num_faces_detected", 0) > 0:
+                        successful_attempts += 1
+                        if result.get("is_synced", False):
+                            # Found synced faces! We can stop here
+                            print(f"[SUCCESS] Found SYNCED faces in {strategy['name']} - confidence: {result.get('confidence', 0):.2f}")
+                            break
+                        else:
+                            # Found faces but they're desynced, keep track and try next location
+                            print(f"[WARN] Found faces in {strategy['name']} but DESYNCED (confidence: {result.get('confidence', 0):.2f})")
+                            print(f"[INFO] Trying next location to find better sync...")
+                            
+                            # Keep the best desynced result (highest confidence)
+                            if best_desynced_result is None or result.get("confidence", 0) > best_desynced_result.get("confidence", 0):
+                                best_desynced_result = result
+                                best_desynced_result["location"] = strategy["name"]
+                            
+                            # Continue to next location (no cleanup)
+                            continue
+                    else:
+                        print(f"[WARN] No faces detected in {strategy['name']}, trying next location...")
+                        # Continue to next location (no cleanup)
+                        continue
+                        
+                except Exception as e:
+                    # Track the error
+                    error_msg = str(e)
+                    print(f"[ERROR] Exception during evaluation of {strategy['name']}: {error_msg}")
+                    import traceback
+                    traceback.print_exc()
+                    errors_encountered.append({
+                        "location": strategy["name"],
+                        "error": error_msg
+                    })
+                    continue
+            
+            # Check if we had errors during processing
+            if errors_encountered:
+                if successful_attempts > 0:
+                    # We had some successes but also errors - this indicates a problem
+                    error_summary = "; ".join([f"{e['location']}: {e['error']}" for e in errors_encountered])
+                    print(f"[ERROR] Mixed results - {successful_attempts} successful, {len(errors_encountered)} errors")
+                    print(f"[ERROR] Errors: {error_summary}")
+                    return jsonify({
+                        "success": False,
+                        "error": f"Processing failed for some locations: {error_summary}",
+                        "successful_attempts": successful_attempts,
+                        "failed_attempts": len(errors_encountered),
+                        "errors": errors_encountered
+                    }), 500
+                elif len(errors_encountered) == len(sampling_strategies):
+                    # ALL attempts failed with errors
+                    error_summary = "; ".join([f"{e['location']}: {e['error']}" for e in errors_encountered])
+                    print(f"[ERROR] All {len(sampling_strategies)} attempts failed with errors")
+                    print(f"[ERROR] Errors: {error_summary}")
+                    return jsonify({
+                        "success": False,
+                        "error": f"All processing attempts failed: {error_summary}",
+                        "failed_attempts": len(errors_encountered),
+                        "errors": errors_encountered
+                    }), 500
+            
+            # Determine final result
+            if result and result.get("success") and result.get("is_synced", False):
+                # Found synced faces in one of the locations
+                print(f"[FINAL] Found synced video segment")
+                result["attempts"] = i  # Number of attempts made
+            elif best_desynced_result:
+                # Never found synced faces, but found desynced faces - use best desynced result
+                result = best_desynced_result
+                result["attempts"] = len(sampling_strategies)
+                location = result.pop("location", "unknown")  # Remove location field, just for logging
+                print(f"[FINAL] All {len(sampling_strategies)} locations checked - best result from {location}")
+                print(f"[FINAL] Best confidence: {result.get('confidence', 0):.2f} - classifying as DESYNCED")
+            else:
+                # No faces found in any location
+                print("[FINAL] No faces detected in any location - classifying as DESYNCED")
+                result = {
+                    "success": True,
+                    "confidence": 0.0,
+                    "av_offset": None,
+                    "is_synced": False,
+                    "threshold": SYNC_CONFIDENCE_THRESHOLD,
+                    "num_faces_detected": 0,
+                    "all_confidences": [],
+                    "attempts": len(sampling_strategies),
+                    "note": "No faces detected in any sampled location"
+                }
+            
+            # No cleanup - keep all files for debugging
             
             if result["success"]:
                 print(f"[SUCCESS] Request completed successfully - Synced: {result['is_synced']}\n")
@@ -371,15 +526,10 @@ def detect_sync():
                 return jsonify(result), 500
                 
         except Exception as e:
-            # Clean up on error
+            # Log error without cleanup
             print(f"[ERROR] Exception during processing: {str(e)}")
-            import shutil
             import traceback
             traceback.print_exc()
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            if os.path.exists(DETECT_RESULTS_DIR):
-                shutil.rmtree(DETECT_RESULTS_DIR)
             raise e
             
     except Exception as e:
