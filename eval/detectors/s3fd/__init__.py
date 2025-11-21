@@ -13,7 +13,7 @@ img_mean = np.array([104.0, 117.0, 123.0])[:, np.newaxis, np.newaxis].astype("fl
 
 class S3FD:
 
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cpu"):
 
         tstamp = time.time()
         self.device = device

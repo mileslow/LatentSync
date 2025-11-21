@@ -49,7 +49,7 @@ def main(config, args):
 
     audio_encoder = Audio2Feature(
         model_path=whisper_model_path,
-        device="cuda",
+        device="cpu",
         num_frames=config.data.num_frames,
         audio_feat_length=config.data.audio_feat_length,
     )

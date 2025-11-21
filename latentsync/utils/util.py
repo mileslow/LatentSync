@@ -28,7 +28,13 @@ from torchvision import transforms
 
 from einops import rearrange
 import cv2
-from decord import AudioReader, VideoReader
+try:
+    from decord import AudioReader, VideoReader
+    DECORD_AVAILABLE = True
+except ImportError:
+    DECORD_AVAILABLE = False
+    AudioReader = None
+    VideoReader = None
 import shutil
 import subprocess
 
@@ -57,13 +63,16 @@ def read_video(video_path: str, change_fps=True, use_decord=True):
     else:
         target_video_path = video_path
 
-    if use_decord:
+    # Fallback to opencv if decord is not available
+    if use_decord and DECORD_AVAILABLE:
         return read_video_decord(target_video_path)
     else:
         return read_video_cv2(target_video_path)
 
 
 def read_video_decord(video_path: str):
+    if not DECORD_AVAILABLE:
+        raise ImportError("decord is not available. Use read_video_cv2 instead or install decord.")
     vr = VideoReader(video_path)
     video_frames = vr[:].asnumpy()
     vr.seek(0)

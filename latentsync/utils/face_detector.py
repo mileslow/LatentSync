@@ -6,7 +6,7 @@ INSIGHTFACE_DETECT_SIZE = 512
 
 
 class FaceDetector:
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cpu"):
         self.app = FaceAnalysis(
             allowed_modules=["detection", "landmark_2d_106"],
             root="checkpoints/auxiliary",
