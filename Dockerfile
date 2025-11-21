@@ -1,46 +1,34 @@
-# Use Python 3.12 slim image for smaller size
-FROM python:3.12-slim
+FROM --platform=linux/amd64 python:3.11
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+# Update package list, install ffmpeg, and clean up in one RUN command
+RUN apt-get update && \
+    apt-get install -y ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+COPY requirements-cpu.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements-cpu.txt
 
-# Copy application code
 COPY . .
+
+# Install gunicorn explicitly
+RUN pip install gunicorn
 
 # Create necessary directories
 RUN mkdir -p checkpoints/auxiliary temp_api detect_results_api
 
-# Download required model files
-# SyncNet model (add download logic if needed)
-RUN if [ ! -f "checkpoints/auxiliary/syncnet_v2.model" ]; then \
-    echo "Warning: syncnet_v2.model not found. Please ensure it's included in the build."; \
-    fi
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
+# Explicitly set port and unset any Flask-specific port variables
 ENV PORT=8080
+ENV FLASK_RUN_PORT=8080
 
-# Expose port
+# Unset any other Flask environment variables that might override the port
+ENV FLASK_APP=
+
+# Make sure the container knows to listen on port 8080
 EXPOSE 8080
 
-# Run the Flask app
-CMD exec python main.py
+CMD ["python", "main.py"]
 
