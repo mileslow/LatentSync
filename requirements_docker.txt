@@ -1,0 +1,32 @@
+# Minimal requirements for sync detection API (CPU-only)
+# PyTorch (torch, torchvision) is installed separately in Dockerfile with CPU-only version
+# This file excludes packages only needed for video generation: diffusers, transformers, 
+# accelerate, einops, mediapipe, librosa, lpips, face-alignment, gradio, kornia, 
+# insightface, onnxruntime, DeepCache
+
+# Core dependencies for sync detection
+numpy==1.26.4
+opencv-python==4.9.0.80
+scipy>=1.11.0
+python_speech_features==0.6
+scenedetect==0.6.1
+matplotlib>=3.0.0
+einops==0.7.0
+
+# Face detection (YOLOv8-based)
+ultralytics>=8.0.0
+
+# API dependencies
+flask==2.3.2
+requests==2.32.3
+
+# Video/audio processing
+ffmpeg-python==0.2.0
+imageio==2.31.1
+imageio-ffmpeg==0.5.1
+
+# Additional utilities
+omegaconf==2.3.0
+huggingface-hub==0.30.2
+pyyaml>=5.1
+
