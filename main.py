@@ -26,16 +26,15 @@ app = Flask(__name__)
 SYNCNET_MODEL_PATH = "checkpoints/auxiliary/syncnet_v2.model"
 SYNC_CONFIDENCE_THRESHOLD = 3.0  # Threshold for binary classification
 TEMP_DIR_BASE = "temp_api"
-DETECT_RESULTS_DIR = "detect_results_api"
+# Note: DETECT_RESULTS_DIR is deprecated - each evaluation creates its own unique directory
 
 # Global model instances (loaded once at startup)
 syncnet = None
-syncnet_detector = None
 
 
 def initialize_models():
     """Initialize SyncNet models on CPU"""
-    global syncnet, syncnet_detector
+    global syncnet
     
     device = "cpu"  # Force CPU usage
     print(f"[INFO] Initializing models on {device}...")
@@ -45,9 +44,7 @@ def initialize_models():
     syncnet.loadParameters(SYNCNET_MODEL_PATH)
     print("[INFO] SyncNet model loaded successfully")
     
-    # Initialize SyncNet detector (face detection + processing)
-    syncnet_detector = SyncNetDetector(device=device, detect_results_dir=DETECT_RESULTS_DIR)
-    print("[INFO] SyncNet detector loaded successfully")
+    # Note: SyncNetDetector instances are created per-evaluation to avoid contamination
 
 
 def download_video(video_url: str, output_path: str) -> bool:
@@ -193,13 +190,14 @@ def preprocess_video(input_path: str, output_path: str, start_time: float = None
         return False
 
 
-def evaluate_sync(video_path: str, temp_dir: str) -> dict:
+def evaluate_sync(video_path: str, temp_dir: str, detect_results_dir: str = None) -> dict:
     """
     Evaluate audio-visual synchronization of a video
     
     Args:
         video_path: Path to the video file
         temp_dir: Temporary directory for processing
+        detect_results_dir: Directory for face detection results (optional, will create unique one if not provided)
         
     Returns:
         Dictionary with sync results
@@ -207,13 +205,20 @@ def evaluate_sync(video_path: str, temp_dir: str) -> dict:
     try:
         print(f"[INFO] Starting sync evaluation for: {video_path}")
         
+        # Create a unique detect_results_dir for this evaluation to avoid contamination
+        if detect_results_dir is None:
+            detect_results_dir = os.path.join(temp_dir, f"detect_results_{uuid.uuid4().hex[:8]}")
+        
+        # Create a detector instance with unique directory
+        local_detector = SyncNetDetector(device="cpu", detect_results_dir=detect_results_dir)
+        
         # Run SyncNet detection
         print("[INFO] Running face detection and tracking...")
-        syncnet_detector(video_path=video_path, min_track=50)
+        local_detector(video_path=video_path, min_track=50)
         print("[INFO] Face detection completed")
         
         # Check if faces were detected
-        crop_dir = os.path.join(DETECT_RESULTS_DIR, "crop")
+        crop_dir = os.path.join(detect_results_dir, "crop")
         crop_videos = os.listdir(crop_dir) if os.path.exists(crop_dir) else []
         
         print(f"[INFO] Found {len(crop_videos)} face track(s)")
@@ -461,7 +466,7 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "models_loaded": syncnet is not None and syncnet_detector is not None,
+        "models_loaded": syncnet is not None,
         "device": "cpu"
     })
 
