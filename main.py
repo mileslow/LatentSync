@@ -12,6 +12,7 @@ import subprocess
 import json
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 import requests
 import torch
@@ -36,8 +37,22 @@ def initialize_models():
     """Initialize SyncNet models on CPU"""
     global syncnet
     
+    # Set deterministic behavior for reproducible results
+    import random
+    import numpy as np
+    
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(False)  # Can't use True with YOLO
+    # Ensure consistent behavior
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     device = "cpu"  # Force CPU usage
     print(f"[INFO] Initializing models on {device}...")
+    print(f"[INFO] Deterministic mode enabled (seed={seed})")
     
     # Initialize SyncNet evaluation model
     syncnet = SyncNetEval(device=device)
@@ -358,41 +373,65 @@ def run_local_mode(video_path: str) -> None:
                 "start_time": quarter_start
             })
         
-        print(f"[INFO] Will try {len(sampling_strategies)} sampling location(s)\n")
+        print(f"[INFO] Will try {len(sampling_strategies)} sampling location(s)")
+        print(f"[INFO] Processing 2 segments in parallel\n")
         
-        # Try each sampling strategy
-        all_results = []
-        
-        for i, strategy in enumerate(sampling_strategies, 1):
-            print(f"\n[ATTEMPT {i}/{len(sampling_strategies)}] Trying {strategy['name']}...")
-            
-            # Create processed video path
-            processed_video_path = os.path.join(temp_dir, f"processed_video_{i}.mp4")
-            
-            # Preprocess video
-            if not preprocess_video(video_path, processed_video_path, start_time=strategy['start_time']):
-                print(f"[WARN] Preprocessing failed for {strategy['name']}, trying next...")
-                continue
-            
-            # Evaluate sync
+        # Helper function to process a single segment
+        def process_segment_local(i: int, strategy: dict) -> tuple:
+            """Process a single segment and return results"""
             try:
+                print(f"\n[ATTEMPT {i}/{len(sampling_strategies)}] Trying {strategy['name']}...")
+                
+                # Create processed video path
+                processed_video_path = os.path.join(temp_dir, f"processed_video_{i}.mp4")
+                
+                # Preprocess video
+                if not preprocess_video(video_path, processed_video_path, start_time=strategy['start_time']):
+                    print(f"[WARN] Preprocessing failed for {strategy['name']}, skipping...")
+                    return (i, None)
+                
+                # Evaluate sync
                 result = evaluate_sync(processed_video_path, temp_dir)
                 
                 if result["success"] and result.get("num_faces_detected", 0) > 0:
                     result_copy = result.copy()
                     result_copy["location"] = strategy["name"]
-                    all_results.append(result_copy)
                     
                     if result.get("is_synced", False):
                         print(f"[SUCCESS] Found SYNCED faces in {strategy['name']} - confidence: {result.get('confidence', 0):.2f}")
                     else:
                         print(f"[WARN] Found faces in {strategy['name']} but DESYNCED (confidence: {result.get('confidence', 0):.2f})")
+                    
+                    return (i, result_copy)
                 else:
                     print(f"[WARN] No faces detected in {strategy['name']}")
+                    return (i, None)
                     
             except Exception as e:
                 print(f"[ERROR] Exception during evaluation of {strategy['name']}: {str(e)}")
-                continue
+                return (i, None)
+        
+        # Process segments in parallel (2 at a time)
+        all_results = []
+        
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Submit all tasks
+            future_to_strategy = {
+                executor.submit(process_segment_local, i, strategy): (i, strategy)
+                for i, strategy in enumerate(sampling_strategies, 1)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_strategy):
+                i, strategy = future_to_strategy[future]
+                try:
+                    idx, result = future.result()
+                    
+                    if result is not None:
+                        all_results.append(result)
+                        
+                except Exception as e:
+                    print(f"[ERROR] Unexpected exception in thread for {strategy['name']}: {str(e)}")
         
         # Print final results
         print("\n" + "=" * 60)
@@ -574,72 +613,92 @@ def detect_sync():
                 })
             
             print(f"[INFO] Video duration: {duration:.1f}s, will try {len(sampling_strategies)} sampling location(s)")
+            print(f"[INFO] Processing 2 segments in parallel")
             
-            # Try each sampling strategy and collect all results
-            result = None
-            all_results = []  # Track all successful detections
-            errors_encountered = []  # Track errors during processing
-            successful_attempts = 0
-            
-            for i, strategy in enumerate(sampling_strategies, 1):
-                print(f"\n[ATTEMPT {i}/{len(sampling_strategies)}] Trying {strategy['name']}...")
-                
-                # Verify raw video still exists
-                if not os.path.exists(raw_video_path):
-                    print(f"[ERROR] Raw video file missing: {raw_video_path}")
-                    errors_encountered.append({
-                        "location": strategy["name"],
-                        "error": "Raw video file missing"
-                    })
-                    continue
-                
-                # Create unique processed video path for this attempt
-                processed_video_path = os.path.join(temp_dir, f"processed_video_{i}.mp4")
-                
-                # Preprocess video with this strategy
-                if not preprocess_video(raw_video_path, processed_video_path, start_time=strategy['start_time']):
-                    print(f"[WARN] Preprocessing failed for {strategy['name']}, trying next...")
-                    errors_encountered.append({
-                        "location": strategy["name"],
-                        "error": "Preprocessing failed"
-                    })
-                    continue
-                
-                # Evaluate sync on preprocessed video (wrap in try-except to catch errors)
+            # Helper function to process a single segment
+            def process_segment(i: int, strategy: dict) -> tuple:
+                """Process a single segment and return results"""
                 try:
+                    print(f"\n[ATTEMPT {i}/{len(sampling_strategies)}] Trying {strategy['name']}...")
+                    
+                    # Verify raw video still exists
+                    if not os.path.exists(raw_video_path):
+                        print(f"[ERROR] Raw video file missing: {raw_video_path}")
+                        return (i, None, {
+                            "location": strategy["name"],
+                            "error": "Raw video file missing"
+                        })
+                    
+                    # Create unique processed video path for this attempt
+                    processed_video_path = os.path.join(temp_dir, f"processed_video_{i}.mp4")
+                    
+                    # Preprocess video with this strategy
+                    if not preprocess_video(raw_video_path, processed_video_path, start_time=strategy['start_time']):
+                        print(f"[WARN] Preprocessing failed for {strategy['name']}, skipping...")
+                        return (i, None, {
+                            "location": strategy["name"],
+                            "error": "Preprocessing failed"
+                        })
+                    
+                    # Evaluate sync on preprocessed video
                     print(f"[INFO] Starting sync evaluation for {strategy['name']}...")
                     result = evaluate_sync(processed_video_path, temp_dir)
                     
                     # Check if we successfully detected faces
                     if result["success"] and result.get("num_faces_detected", 0) > 0:
-                        successful_attempts += 1
                         result_copy = result.copy()
                         result_copy["location"] = strategy["name"]
-                        all_results.append(result_copy)
                         
                         if result.get("is_synced", False):
                             print(f"[SUCCESS] Found SYNCED faces in {strategy['name']} - confidence: {result.get('confidence', 0):.2f}")
                         else:
                             print(f"[WARN] Found faces in {strategy['name']} but DESYNCED (confidence: {result.get('confidence', 0):.2f})")
                         
-                        # Continue trying other locations to get more data points
-                        continue
+                        return (i, result_copy, None)
                     else:
-                        print(f"[WARN] No faces detected in {strategy['name']}, trying next location...")
-                        # Continue to next location (no cleanup)
-                        continue
+                        print(f"[WARN] No faces detected in {strategy['name']}")
+                        return (i, None, None)
                         
                 except Exception as e:
-                    # Track the error
                     error_msg = str(e)
                     print(f"[ERROR] Exception during evaluation of {strategy['name']}: {error_msg}")
                     import traceback
                     traceback.print_exc()
-                    errors_encountered.append({
+                    return (i, None, {
                         "location": strategy["name"],
                         "error": error_msg
                     })
-                    continue
+            
+            # Process segments in parallel (2 at a time)
+            all_results = []  # Track all successful detections
+            errors_encountered = []  # Track errors during processing
+            
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                # Submit all tasks
+                future_to_strategy = {
+                    executor.submit(process_segment, i, strategy): (i, strategy)
+                    for i, strategy in enumerate(sampling_strategies, 1)
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_strategy):
+                    i, strategy = future_to_strategy[future]
+                    try:
+                        idx, result, error = future.result()
+                        
+                        if result is not None:
+                            all_results.append(result)
+                        elif error is not None:
+                            errors_encountered.append(error)
+                            
+                    except Exception as e:
+                        print(f"[ERROR] Unexpected exception in thread for {strategy['name']}: {str(e)}")
+                        errors_encountered.append({
+                            "location": strategy["name"],
+                            "error": str(e)
+                        })
+            
+            successful_attempts = len(all_results)
             
             # Check if we had errors during processing
             if errors_encountered:
